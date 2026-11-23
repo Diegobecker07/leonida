@@ -518,6 +518,9 @@ void set_reference_settler(ReferenceSettler settle);
 // counts. Calls made before that are not counted (the counter stays 0); they set only the first-call flags.
 std::uint64_t device_slot_hits(unsigned slot);
 bool device_slot_first_call_seen(unsigned slot);
+// For a slot the proxy forwards by number (not one with a handler of its own): the caller of its first call as
+// module+offset ("host:<exe>+0x..." for host code), the same text the first-call log line names; "" before one.
+std::string device_slot_first_caller(unsigned slot);
 std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
