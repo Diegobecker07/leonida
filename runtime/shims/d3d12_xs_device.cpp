@@ -41,7 +41,6 @@
 #include "../src/frame_pacer.h"
 #include "../src/local_diagnostics.h"
 #include "d3d12_xs_pso_stream.h"
-#include "shims.h"  // rt::shims::module_offset names the caller of a slot's first call
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/title_page_watch.h"  // leonida::kernel_writes for slot 14
 
@@ -390,6 +389,16 @@ std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
 // The return address of the first call of each slot that reached the generic forwarding branch (0: none yet).
 std::atomic<std::uint64_t> g_first_caller[kMaxSlots];
+// Names a caller address (set_device_slot_caller_formatter); null: the bare address in hex. gta6rt sets
+// rt::shims::module_offset, so this file does not depend on the module table and test targets link it alone.
+std::atomic<CallerFormatter> g_caller_formatter{nullptr};
+
+std::string format_caller(std::uint64_t address) {
+    if (const CallerFormatter formatter = g_caller_formatter.load(std::memory_order_relaxed)) return formatter(address);
+    char text[32];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    return text;
+}
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
@@ -492,7 +501,7 @@ void note_slot(unsigned slot, const void* caller = nullptr) {
         const auto address = reinterpret_cast<std::uint64_t>(caller);
         g_first_caller[slot].store(address, std::memory_order_relaxed);
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call from %s\n", slot, slot_name(slot),
-                     rt::shims::module_offset(address).c_str());
+                     format_caller(address).c_str());
     } else if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
     } else if (slot >= 3 && trace_enabled()) {
@@ -6701,7 +6710,11 @@ bool device_slot_first_call_seen(unsigned slot) {
 
 std::string device_slot_first_caller(unsigned slot) {
     const std::uint64_t address = slot < kMaxSlots ? g_first_caller[slot].load(std::memory_order_relaxed) : 0;
-    return address ? rt::shims::module_offset(address) : std::string();
+    return address ? format_caller(address) : std::string();
+}
+
+void set_device_slot_caller_formatter(CallerFormatter formatter) {
+    g_caller_formatter.store(formatter, std::memory_order_relaxed);
 }
 
 unsigned long device_proxy_ref_count(const void* device) {
@@ -6744,6 +6757,7 @@ void reset_device_proxy_stats() {
     for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
+        g_first_caller[slot].store(0, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
     }
     for (unsigned slot = 0; slot < kHeapSlots; ++slot) {
