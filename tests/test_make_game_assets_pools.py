@@ -43,6 +43,14 @@ def follow_that_does_nothing(source, pool_dir, manifest, settings):
     return (0, 0)
 
 
+def fail_after(name, seconds):
+    # Module level so a worker process can pick it up.
+    time.sleep(seconds)
+    if name.startswith("bad"):
+        raise ValueError(name)
+    return name
+
+
 class AssetsPoolsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -186,33 +194,33 @@ class AssetsPoolsTest(unittest.TestCase):
         self.pool("data/ttdb/two.ttpf", 101)
         os.makedirs(os.path.join(self.out, "meeting"))
 
-    def test_exports_run_side_by_side_within_the_jobs_budget(self):
+    def test_exports_run_one_at_a_time_with_the_whole_budget(self):
+        # rpf9dump spreads one export over the cores, so several jobs still export one pool at a time, each with
+        # the stage's whole --jobs budget.
         self.two_pools()
         seen = []
+        running = []
 
         def fake_run(cmd, *a, **k):
-            # Only returns if the other pool's export is running now.
-            if not meet(os.path.join(self.out, "meeting"), os.path.basename(cmd[2]), 2):
-                raise AssertionError("export ran alone")
+            running.append(cmd)
+            self.assertEqual(len(running), 1, "two exports ran side by side")
             src, dest = cmd[2], cmd[3]
             pool_dir = os.path.join(dest, os.path.splitext(os.path.basename(src))[0])
             os.makedirs(pool_dir, exist_ok=True)
             with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
                 json.dump({"Count": 0, "Textures": []}, f)
             seen.append(cmd)
+            running.remove(cmd)
 
-        digest = make_game.decoder_digest()
         with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
              mock.patch.object(make_game, "run", fake_run), \
              mock.patch.object(make_game.shutil, "which", lambda n: None), \
              mock.patch.object(make_game, "log", lambda *a: None), \
              mock.patch.object(ttpf_assets, "complete_pool", follow_that_does_nothing):
             make_game.assets(self.game, self.work, False, 4, dump_jobs=4)
-        self.assertEqual(len(seen), 2)
-        # 4 jobs over 2 side-by-side exports: 2 each, never more than the budget in total.
+        self.assertEqual([os.path.basename(cmd[2]) for cmd in seen], ["one.ttpf", "two.ttpf"])
         for cmd in seen:
-            self.assertEqual(cmd[cmd.index("--jobs") + 1], "2")
-        self.assertEqual(digest, make_game.decoder_digest())
+            self.assertEqual(cmd[cmd.index("--jobs") + 1], "4")
 
     def test_one_job_runs_exports_one_at_a_time_as_before(self):
         self.two_pools()
@@ -258,6 +266,61 @@ class AssetsPoolsTest(unittest.TestCase):
             make_game.assets(self.game, self.work, False, 2)
         self.assertIn(os.path.join("ttpf", "one"), stderr.getvalue())
         self.assertNotIn(os.path.join("ttpf", "two"), stderr.getvalue())
+
+    def test_the_largest_pools_follow_first(self):
+        # The pass starts the longest pools first, so the last one doesn't run alone at the end. With one job the
+        # calls run inline in that order.
+        self.pool("data/ttdb/small.ttpf", 100)
+        self.pool("data/ttdb/large.ttpf", 300)
+        self.pool("data/ttdb/middle.ttpf", 200)
+        order = []
+
+        def record(source, pool_dir, manifest, settings):
+            order.append(os.path.basename(pool_dir))
+            return (0, 0)
+
+        def fake_run(cmd, *a, **k):
+            src, dest = cmd[2], cmd[3]
+            pool_dir = os.path.join(dest, os.path.splitext(os.path.basename(src))[0])
+            os.makedirs(pool_dir, exist_ok=True)
+            with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
+                json.dump({"Count": 0, "Textures": []}, f)
+
+        with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+             mock.patch.object(make_game, "run", fake_run), \
+             mock.patch.object(make_game.shutil, "which", lambda n: None), \
+             mock.patch.object(make_game, "log", lambda *a: None), \
+             mock.patch.object(ttpf_assets, "complete_pool", record):
+            make_game.assets(self.game, self.work, False, 1)
+        self.assertEqual(order, ["large", "middle", "small"])
+
+    def test_a_follow_up_reads_its_own_manifest_and_reports_a_broken_one(self):
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        os.makedirs(pool_dir)
+        with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
+            json.dump({"Count": 1, "Textures": []}, f)   # Count doesn't match the rows
+        with self.assertRaises(make_game.ExportFailed) as caught:
+            make_game.follow_pool(follow_that_does_nothing, "pool.ttpf", pool_dir, None)
+        self.assertIn(pool_dir, str(caught.exception))
+        with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
+            json.dump({"Count": 0, "Textures": []}, f)
+        self.assertEqual(make_game.follow_pool(follow_that_does_nothing, "pool.ttpf", pool_dir, None), (0, 0))
+
+
+class ParallelMapTest(unittest.TestCase):
+    def test_results_come_in_item_order_and_every_item_is_counted(self):
+        done = []
+        items = [("first", 0.4), ("second", 0.0), ("third", 0.2)]
+        result = make_game.parallel_map(fail_after, items, 3, on_done=lambda: done.append(1))
+        self.assertEqual(result, ["first", "second", "third"])
+        self.assertEqual(len(done), 3)
+
+    def test_the_earliest_failure_in_item_order_is_raised(self):
+        # "bad-late" fails after "bad-early" in time, but comes first in the list, so its failure is the one raised.
+        items = [("bad-late", 0.5), ("bad-early", 0.0), ("ok", 0.0)]
+        with self.assertRaises(ValueError) as caught:
+            make_game.parallel_map(fail_after, items, 3)
+        self.assertEqual(str(caught.exception), "bad-late")
 
 
 if __name__ == "__main__":
