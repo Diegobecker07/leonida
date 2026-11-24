@@ -267,13 +267,16 @@ class AssetsPoolsTest(unittest.TestCase):
         self.assertIn(os.path.join("ttpf", "one"), stderr.getvalue())
         self.assertNotIn(os.path.join("ttpf", "two"), stderr.getvalue())
 
-    def test_the_largest_pools_follow_first(self):
-        # The pass starts the longest pools first, so the last one doesn't run alone at the end. With one job the
-        # calls run inline in that order.
-        self.pool("data/ttdb/small.ttpf", 100)
-        self.pool("data/ttdb/large.ttpf", 300)
-        self.pool("data/ttdb/middle.ttpf", 200)
-        order = []
+    def test_the_costliest_pools_follow_first(self):
+        # The pass starts the pools with the most pixels to decode first, so the longest one doesn't run alone at
+        # the end; the source file's size doesn't count, and a pool the pass already stamped costs nothing. With
+        # one job the calls run inline in that order.
+        stamp = ttpf_assets.load_profile(self.work)[0]
+        side = {"few": 16, "many": 1024, "some": 256, "stamped": 2048}
+        size = {"few": 400, "many": 100, "some": 200, "stamped": 300}
+        for name in side:
+            self.pool(f"data/ttdb/{name}.ttpf", size[name])
+        order, exported = [], []
 
         def record(source, pool_dir, manifest, settings):
             order.append(os.path.basename(pool_dir))
@@ -281,18 +284,35 @@ class AssetsPoolsTest(unittest.TestCase):
 
         def fake_run(cmd, *a, **k):
             src, dest = cmd[2], cmd[3]
-            pool_dir = os.path.join(dest, os.path.splitext(os.path.basename(src))[0])
+            name = os.path.splitext(os.path.basename(src))[0]
+            exported.append(name)
+            pool_dir = os.path.join(dest, name)
             os.makedirs(pool_dir, exist_ok=True)
+            # One BC1 texture the export left without a file: a candidate for the follow-up.
+            row = {"Index": 0, "File": None, "DxgiFormat": 71, "Width": side[name], "Height": side[name], "Depth": 1}
+            doc = {"Count": 1, "Textures": [row]}
+            if name == "stamped":
+                doc["BCPackPass"] = stamp
             with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
-                json.dump({"Count": 0, "Textures": []}, f)
+                json.dump(doc, f)
 
-        with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
-             mock.patch.object(make_game, "run", fake_run), \
-             mock.patch.object(make_game.shutil, "which", lambda n: None), \
-             mock.patch.object(make_game, "log", lambda *a: None), \
-             mock.patch.object(ttpf_assets, "complete_pool", record):
-            make_game.assets(self.game, self.work, False, 1)
-        self.assertEqual(order, ["large", "middle", "small"])
+        def build():
+            with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                 mock.patch.object(make_game, "run", fake_run), \
+                 mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                 mock.patch.object(make_game, "log", lambda *a: None), \
+                 mock.patch.object(ttpf_assets, "complete_pool", record):
+                make_game.assets(self.game, self.work, False, 1)
+
+        build()
+        self.assertEqual(exported, ["many", "some", "stamped", "few"])   # exports go smallest file first
+        self.assertEqual(order, ["many", "some", "few", "stamped"])
+        # A resumed build reads the published manifests instead of exporting, and keeps the same order.
+        exported.clear()
+        order.clear()
+        build()
+        self.assertEqual(exported, [])
+        self.assertEqual(order, ["many", "some", "few", "stamped"])
 
     def test_a_follow_up_reads_its_own_manifest_and_reports_a_broken_one(self):
         pool_dir = os.path.join(self.out, "ttpf", "pool")

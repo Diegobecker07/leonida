@@ -2250,6 +2250,24 @@ def follow_pool(complete, source: str, pool_dir: str, settings) -> tuple[int, in
     return complete(source, pool_dir, manifest, settings)
 
 
+def follow_cost(manifest: dict, settings, candidate) -> int:
+    """How long a pool's BCPack follow-up takes, as the pixels of the rows it decodes (candidate is
+    ttpf_assets.candidate); 0 for a pool the pass already stamped. The source pool's size is a poor guide: on the
+    retail pools a 0.8 GiB pool of 1,038 candidate rows took longer than any 2.5 GiB terrain pool of ~250."""
+    stamp, profile = settings
+    if manifest.get("BCPackPass") == stamp:
+        return 0
+    total = 0
+    for row in manifest["Textures"]:
+        if candidate(row, profile):
+            pixels = 1
+            for key in ("Width", "Height", "Depth"):
+                n = row.get(key)
+                pixels *= n if type(n) is int and n > 0 else 1
+            total += pixels
+    return total
+
+
 def parallel_map(fn, items: list, workers: int, *, on_done=None) -> list:
     """Run fn(*item) for every item in up to `workers` worker processes and return the results in item order.
 
@@ -2358,8 +2376,16 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
             shutil.rmtree(pool_dir)
         pool_jobs.append((p, name, root, pool_dir, record))
 
-    pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs
-                 if ttpf_manifest(pool_dir) is None]
+    # Each pool's follow-up cost comes from the manifest these checks read anyway (after the export, for a pool
+    # exported below); only the cost is kept, the worker reads the manifest again.
+    cost = {}
+    pool_todo = []
+    for job in pool_jobs:
+        manifest = ttpf_manifest(job[3])
+        if manifest is None:
+            pool_todo.append(job)
+        else:
+            cost[job[3]] = follow_cost(manifest, settings, ttpf_assets.candidate)
     pool_follow = pool_jobs
     need_audio = not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json"))
     ogg = os.path.join(out, "audio", "ogg")
@@ -2389,13 +2415,15 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
         dump("ttpf", p, root)
-        if ttpf_manifest(pool_dir) is None:
+        manifest = ttpf_manifest(pool_dir)
+        if manifest is None:
             fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+        cost[pool_dir] = follow_cost(manifest, settings, ttpf_assets.candidate)
         progress.tick(force=True)
     # The follow-up pass decodes BCPack in pure Python, which keeps one core busy per pool, so each pool runs in its
-    # own worker process, within the stage's CPU budget. The largest pools start first, so the longest one doesn't
+    # own worker process, within the stage's CPU budget. The costliest pools start first, so the longest one doesn't
     # run alone at the end. The log lines come in pool order once the pass is done, as from a serial run.
-    follow = sorted(pool_follow, key=lambda job: os.path.getsize(job[0]), reverse=True)
+    follow = sorted(pool_follow, key=lambda job: cost[job[3]], reverse=True)
     try:
         done = parallel_map(follow_pool, [(ttpf_assets.complete_pool, p, pool_dir, settings)
                                           for p, _, _, pool_dir, _ in follow],
